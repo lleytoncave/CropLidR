@@ -1,0 +1,297 @@
+####LIDAR Processing Script####
+
+# Lleyton Cave
+# uqlcave@uq.edu.au
+# 27_02_2022
+
+#  A script utilising the free R package lidR to processes UAV captured LIDAR and RGB 3D point cloud data
+#- and extract plot level values of canopy height
+
+# Refer to https://r-lidar.github.io/lidRbook/ or the vignette for description of package functions, processes and further capabilities
+
+# General Steps:
+#1. Reading of LIDAR data in format .las or .laz
+#2. Viewing of Data in 3d or 2d form
+#3. Classification of ground and non-ground returns
+#4. Creation of a digital terrain model (DTM) from ground classified points
+#5. Subtraction of terrain from non-ground returns to get absolute height
+#6. Ceation of a canopy height model (chm) to show canopy surface structure
+#7. Extraction of plot max, mean (95th percentile) height values from the chm (Shapefiles Required)
+
+rm(list = ls())
+par(ask = T)
+
+
+####Required Packages####
+library(lidR)
+library(sf)
+library(ggplot2)
+library(terra)
+library(dplyr)
+library(RCSF)
+
+
+####1. Read .las####
+#set Project wd
+setwd("C:/Users/lleyt/rLIDAR/")
+
+#read .las file
+#save files from R:/ to local drive for faster read
+las <- readLAS("cloud_50m.las", filter = "-inside 432836 6950782 433018 6950961")
+
+##Optional run Check
+#las_check(las)
+
+
+
+####2. View .las####
+#can view in 3d via plot(las), significant rendering time
+
+#view in 2d
+# -turn point to raster
+DSM <- rasterize_canopy(las, res = 1, algorithm = p2r())
+col <- height.colors(25)
+plot(DSM, col = col)
+
+#If outliers present can use filter_poi to reove extreme values
+#outliers (Y/N) ??
+las <- filter_poi(las, Z>=min(Z), Z<=max(Z-1))
+
+#Review in 2d
+DSM <- rasterize_canopy(las, res = 1, algorithm = p2r())
+col <- height.colors(25)
+plot(DSM, col = col)
+
+#View a cross-section
+#x coord could be x min and max though in this case too large. 
+p1 = c(432900, mean(las@data$Y))
+p2 = c(432920, mean(las@data$Y))
+width = 0.5
+
+csd <- clip_transect(las, p1, p2, width)
+
+ggplot(csd@data, aes(X,Z, color = Z))+ geom_point(size = 0.25) + coord_equal() + theme_minimal() + scale_color_gradientn(colours = height.colors(50))
+
+#Cross section plotting function useful in next step
+plot_crossection <- function(las,
+                             p1 = c(min(las@data$X) + 80, mean(las@data$Y)),
+                             p2 = c(max(las@data$X) - 80, mean(las@data$Y)),
+                             width = 0.2, colour_by = NULL)
+{
+  colour_by <- enquo(colour_by)
+  data_clip <- clip_transect(las, p1, p2, width)
+  p <- ggplot(data_clip@data, aes(X,Z)) + geom_point(size = 0.5) + coord_equal() + theme_minimal()
+
+  if (!is.null(colour_by))
+    p <- p + aes(color = !!colour_by) + labs(color = "")
+
+  return(p)
+}
+
+
+
+####3. Ground Return Classification####
+## lidR contains many ground return classification algorithms
+## can change the below and introduce parameters to optimise
+
+#Uses a cloth simulation function
+las <- classify_ground(las, algorithm = csf(sloop_smooth = F, class_threshold = 0.1, cloth_resolution = 0.4, rigidness = 3 ))
+
+plot_crossection(las, colour_by = factor(Classification))
+
+
+
+####4. Digital Terrain Model Creation####
+
+#purely from classification
+gnd <- filter_ground(las)
+gnd_raster <- rasterize_canopy(gnd, res = 1, algorithm = p2r())
+plot(gnd_raster)
+
+#With use of TIN: Triangular irregular network
+dtm_tin <- rasterize_terrain(las, res = 1, algorithm = tin())
+plot(dtm_tin)
+
+
+
+####5. Height Normalisation####
+#subtract dtm from non-ground returns
+nH_las <- las - dtm_tin
+
+
+
+####6. Creation of a Canopy Height Model####
+chm <- rasterize_canopy(nH_las, res = 1, algorithm = p2r())
+col <- height.colors(25)
+plot(chm, col = col)
+
+#Crossectional view
+csd <- clip_transect(nH_las, p1, p2, width)
+ggplot(csd@data, aes(X,Z, color = Z))+ geom_point(size = 0.25) + coord_equal() + theme_minimal() + scale_color_gradientn(colours = height.colors(50))
+
+
+
+####7. Plotwise height extraction####
+plot(chm, col = col)
+
+plot_sf1 <- st_read("MC_NB_GDA94.shp")
+plot_sf2 <- st_read("Sil_Gr_NB_GDA94.shp")
+
+#Add sf to plot
+plot(plot_sf1$geometry, add = T)
+plot(plot_sf2$geometry, add = T)
+
+#View Plot_IDs ?
+
+#Create terra format SpatVector for use with terra::extract
+sf_1 <- vect(x = plot_sf1$geometry)
+sf_2 <- vect(x = plot_sf2$geometry)
+
+#IDs and Row Range Information
+df_sf1 <- as.data.frame(plot_sf1)
+df_sf2 <- as.data.frame(plot_sf2)
+
+#Relevant Columns
+df_sf1 <- df_sf1 %>%
+  dplyr::select("Plot_ID", "Row_1", "Range")
+
+df_sf2 <- df_sf2 %>%
+  dplyr::select("Plot_ID", "Row", "Range")
+
+#Height extraction
+#Max
+max_1 <- terra::extract(chm, sf_1, list = F, fun = max)
+colnames(max_1) <- c("ID", "Max_H")
+max_2 <- terra::extract(chm, sf_2, list = F, fun = max)
+colnames(max_2) <- c("ID", "Max_H")
+
+#Mean
+mean_1 <- terra::extract(chm, sf_1, list = F, fun = mean)
+colnames(mean_1) <- c("ID", "Mean_H")
+mean_2 <- terra::extract(chm, sf_2, list = F, fun = mean)
+colnames(mean_2) <- c("ID", "Mean_H")
+
+#95th Percentile???
+
+#Combine
+Heights_1 <- merge(max_1, mean_1, by = "ID")
+Heights_2 <- merge(max_2, mean_2, by = "ID")
+
+##Shapefile 1
+#Into single df Heights and Row Range
+df_1 <- cbind(df_sf1, Heights_1)
+df_1 <- as.data.frame(df_1)
+
+##Plot
+#MAX
+ggplot(df_1, aes(x=Row_1, y=Range, fill = Max_H))+
+  geom_tile()+
+  scale_fill_distiller(palette = "RdYlBu")+
+  coord_trans(y = "reverse")
+
+#MEAN
+ggplot(df_1, aes(x=Row_1, y=Range, fill = Mean_H))+
+  geom_tile()+
+  scale_fill_distiller(palette = "RdYlBu")+
+  coord_trans(y = "reverse")
+
+
+##Shapefile 2
+#Into single df Heights and Row Range
+df_2 <- cbind(df_sf2, Heights_2)
+df_2 <- as.data.frame(df_2)
+
+##Plot
+#MAX
+ggplot(df_2, aes(x=Row, y=Range, fill = Max_H))+
+  geom_tile()+
+  scale_fill_distiller(palette = "RdYlBu")+
+  coord_trans(y = "reverse")
+
+#MEAN
+ggplot(df_2, aes(x=Row, y=Range, fill = Mean_H))+
+  geom_tile()+
+  scale_fill_distiller(palette = "RdYlBu")+
+  coord_trans(y = "reverse")
+
+
+
+####Observation of the Canopy Height Model as a Range Transect####
+####Plot Lables####
+plot_sf1$centroid <- st_centroid(plot_sf1$geometry)
+sf_df <- plot_sf1 %>%
+  dplyr::select("Row_1", "Range", "Plot_ID", "centroid")
+point_df <- st_geometry(plot_sf1$centroid)
+length = as.numeric(length(point_df))
+list = list()
+for (i in 1:length) {
+  list[[i]] <- t(unlist(point_df[[i]]))
+}
+list <- data.frame(matrix(unlist(list), nrow=length(list), byrow=TRUE))
+colnames(list) <- c("x1", "y1")
+df <- cbind(sf_df, list)
+
+
+#### Cross sectional view for each column####
+#View Classification results ??
+##Loop##
+for (i in 1:length(plot_sf1$Range)){
+  par(ask = T)
+  
+  plot_sf1$centroid <- st_centroid(plot_sf1$geometry)
+  
+  #starting at Range 1
+  R1 <- plot_sf1 %>%
+    filter(Range == i)
+  
+  #Buffer/Edge Plot Centers
+  CS1 <- R1 %>%
+    filter(Row_1 == min(Row_1))
+  CS2 <- R1 %>%
+    filter(Row_1 == max(Row_1))
+  
+  CS1 <- unlist(CS1$centroid)
+  CS2 <- unlist(CS2$centroid)
+  
+  x0 <- CS1[1]
+  x1 <- CS2[1]
+  y0 <- CS1[2]
+  y1 <- CS2[2]
+  
+  plot(chm, col = col)
+  segments(x0,y0,x1,y1, col = "red", lwd = 2)
+  plot(plot_sf1$geometry, add = T)
+  text(df$x1, df$y1, df$Plot_ID, cex = 0.25)
+  
+  
+  p1 = c(x0, y0)
+  p2 = c(x1, y1)
+  width = 0.5
+  
+  csd <- clip_transect(nH_las, p1, p2, width)
+  
+  print(ggplot(csd@data, aes(X,Z, color = Z))+ geom_point(size = 0.25) + coord_equal() + theme_minimal() + scale_color_gradientn(colours = height.colors(50)))
+  
+  print("[esc] to exit loop")
+}
+
+  
+###END###
+
+##To alter
+#-Write csv of plotwise Heights at end for further analysis
+#-Optimise Classification
+#-Options of Classification and dtm creation
+#-95th Percentile of Height
+#-RGB colour channels 
+#-Angle of Pixels
+#-ShinyR ??
+#-resolution of dtm?? lower.
+#-Individual plot views
+
+#When first read
+#R <- las@data$R
+#G <- las@data$G
+#B <- las@data$B
+
+#book multispectral coloring??
